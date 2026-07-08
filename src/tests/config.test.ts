@@ -14,7 +14,16 @@ import path from "node:path";
 import os from "node:os";
 
 // Import modules to test
-import { loadConfigFromYaml, getConfigPath, getEnabledServersArg } from "../config/config-loader.js";
+import {
+  getConfigPath,
+  getEnabledServersArg,
+  getLoadUserSshConfigFlag,
+  getNoSshConfigFlag,
+  getSshConfigPathsArg,
+  loadConfigFromSources,
+  loadConfigFromYaml,
+} from "../config/config-loader.js";
+import { loadSshConfigFiles } from "../config/ssh-config-loader.js";
 
 describe("Config Loader", () => {
   let tempDir: string;
@@ -231,6 +240,260 @@ describe("Argument Parsing", () => {
     const servers = getEnabledServersArg(args);
     assert.deepStrictEqual(servers, ["dev", "prod", "staging"]);
   });
+
+  it("should extract repeated --ssh-config paths", () => {
+    const args = ["--ssh-config", "a,b", "--config", "servers.yaml", "--ssh-config", "c"];
+    assert.deepStrictEqual(getSshConfigPathsArg(args), ["a", "b", "c"]);
+  });
+
+  it("should detect --no-ssh-config", () => {
+    assert.strictEqual(getNoSshConfigFlag(["--config", "servers.yaml", "--no-ssh-config"]), true);
+    assert.strictEqual(getNoSshConfigFlag(["--config", "servers.yaml"]), false);
+  });
+
+  it("should leave OpenSSH config loading to YAML unless CLI disables it", () => {
+    assert.strictEqual(getLoadUserSshConfigFlag(["--config", "servers.yaml"]), undefined);
+    assert.strictEqual(
+      getLoadUserSshConfigFlag(["--config", "servers.yaml", "--no-ssh-config"]),
+      false,
+    );
+  });
+});
+
+describe("OpenSSH Config Loading", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "handfree-ssh-mcp-test-"));
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("should load concrete Host entries from an OpenSSH config", () => {
+    const keyPath = path.join(tempDir, "id_ed25519");
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(keyPath, "fake-key");
+    fs.writeFileSync(sshConfigPath, `
+Host dev
+  HostName dev.example.com
+  User deploy
+  Port 2202
+  IdentityFile "${keyPath}"
+
+Host *
+  User fallback
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.ok(result.files.includes(fs.realpathSync(sshConfigPath)));
+    assert.strictEqual(result.configs.dev.host, "dev.example.com");
+    assert.strictEqual(result.configs.dev.username, "deploy");
+    assert.strictEqual(result.configs.dev.port, 2202);
+    assert.strictEqual(result.configs.dev.privateKey, path.normalize(keyPath));
+    assert.strictEqual(result.configs.dev.authOptional, true);
+  });
+
+  it("should apply wildcard defaults and token replacement", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(sshConfigPath, `
+Host app
+  HostName %n.internal
+
+Host *
+  User ops
+  Port 2222
+  IdentityFile ~/.ssh/%r-%n
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.app.host, "app.internal");
+    assert.strictEqual(result.configs.app.username, "ops");
+    assert.strictEqual(result.configs.app.port, 2222);
+    assert.strictEqual(
+      result.configs.app.privateKey,
+      path.normalize(path.join(os.homedir(), ".ssh", "ops-app")),
+    );
+  });
+
+  it("should parse OpenSSH keyword=value syntax", () => {
+    const keyPath = path.join(tempDir, "id_ed25519");
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(keyPath, "fake-key");
+    fs.writeFileSync(sshConfigPath, `
+Host eq
+  HostName=eq.example.com
+  User = deploy
+  Port=2202
+  IdentityFile = "${keyPath}"
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.eq.host, "eq.example.com");
+    assert.strictEqual(result.configs.eq.username, "deploy");
+    assert.strictEqual(result.configs.eq.port, 2202);
+    assert.strictEqual(result.configs.eq.privateKey, path.normalize(keyPath));
+  });
+
+  it("should respect OpenSSH disabled identity and agent settings", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(sshConfigPath, `
+Host locked
+  HostName locked.example.com
+  User deploy
+  IdentityFile none
+  IdentityAgent none
+  IdentitiesOnly yes
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.locked.privateKey, undefined);
+    assert.strictEqual(result.configs.locked.agent, false);
+    assert.strictEqual(result.configs.locked.identitiesOnly, true);
+  });
+
+  it("should map OpenSSH ProxyJump aliases to jumpHost", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(sshConfigPath, `
+Host bastion
+  HostName bastion.example.com
+  User gate
+
+Host target
+  HostName target.internal
+  User app
+  ProxyJump bastion
+`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.target.jumpHost, "bastion");
+    assert.strictEqual(result.configs.bastion.jumpHost, undefined);
+  });
+
+  it("should load Include files", () => {
+    const includedPath = path.join(tempDir, "included.conf");
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    fs.writeFileSync(includedPath, `
+Host inc
+  HostName inc.example.com
+  User included
+`);
+    fs.writeFileSync(sshConfigPath, `Include "${includedPath}"`);
+
+    const result = loadSshConfigFiles([sshConfigPath]);
+    assert.strictEqual(result.configs.inc.host, "inc.example.com");
+    assert.strictEqual(result.configs.inc.username, "included");
+    assert.ok(result.files.includes(fs.realpathSync(includedPath)));
+  });
+
+  it("should merge YAML server settings over OpenSSH config entries", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(sshConfigPath, `
+Host dev
+  HostName ssh.example.com
+  User sshuser
+  Port 22
+`);
+    fs.writeFileSync(yamlPath, `
+servers:
+  dev:
+    host: yaml.example.com
+    whitelist:
+      - "^pwd$"
+    allowedRemoteDirectories: []
+`);
+
+    const result = loadConfigFromSources({
+      yamlConfigPath: yamlPath,
+      sshConfigPaths: [sshConfigPath],
+    });
+    assert.strictEqual(result.configs.dev.host, "yaml.example.com");
+    assert.strictEqual(result.configs.dev.username, "sshuser");
+    assert.deepStrictEqual(result.configs.dev.commandWhitelist, ["^pwd$"]);
+    assert.deepStrictEqual(result.configs.dev.allowedRemoteDirectories, []);
+  });
+
+  it("should validate YAML jumpHost after merging with OpenSSH config", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(sshConfigPath, `
+Host bastion
+  HostName bastion.example.com
+  User gate
+
+Host target
+  HostName target.internal
+  User app
+`);
+    fs.writeFileSync(yamlPath, `
+servers:
+  target:
+    jumpHost: bastion
+    commandMode: blacklist
+`);
+
+    const result = loadConfigFromSources({
+      yamlConfigPath: yamlPath,
+      sshConfigPaths: [sshConfigPath],
+    });
+    assert.strictEqual(result.configs.target.jumpHost, "bastion");
+    assert.strictEqual(result.configs.target.commandMode, "blacklist");
+  });
+
+  it("should still reject YAML-only servers without auth", () => {
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(yamlPath, `
+sshConfig: false
+servers:
+  broken:
+    host: 192.168.1.1
+    username: test
+`);
+
+    assert.throws(
+      () => loadConfigFromYaml(yamlPath),
+      /password.*privateKey.*required/i,
+    );
+  });
+
+  it("should reject partial YAML servers without a matching OpenSSH host", () => {
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(yamlPath, `
+sshConfig: false
+servers:
+  missing-base:
+    whitelist:
+      - "^pwd$"
+`);
+
+    assert.throws(
+      () => loadConfigFromSources({ yamlConfigPath: yamlPath }),
+      /host.*required/i,
+    );
+  });
+
+  it("should let explicit --ssh-config paths override YAML sshConfig false", () => {
+    const sshConfigPath = path.join(tempDir, "ssh_config");
+    const yamlPath = path.join(tempDir, "servers.yaml");
+    fs.writeFileSync(sshConfigPath, `
+Host explicit
+  HostName explicit.example.com
+  User deploy
+`);
+    fs.writeFileSync(yamlPath, `
+sshConfig: false
+`);
+
+    const result = loadConfigFromSources({
+      yamlConfigPath: yamlPath,
+      sshConfigPaths: [sshConfigPath],
+    });
+    assert.strictEqual(result.configs.explicit.host, "explicit.example.com");
+  });
 });
 
 describe("Whitelist/Blacklist Config", () => {
@@ -268,6 +531,7 @@ servers:
       "^cat .*$",
       "^docker ps.*$"
     ]);
+    assert.strictEqual(result.configs["dev"].commandMode, "whitelist");
   });
 
   it("should load blacklist patterns", () => {
@@ -290,6 +554,7 @@ servers:
       "^rm .*$",
       "^shutdown.*$"
     ]);
+    assert.strictEqual(result.configs["dev"].commandMode, undefined);
   });
 
   it("should load both whitelist and blacklist", () => {
@@ -311,6 +576,45 @@ servers:
     
     assert.deepStrictEqual(result.configs["dev"].commandWhitelist, ["^.*$"]);
     assert.deepStrictEqual(result.configs["dev"].commandBlacklist, ["^rm -rf.*$"]);
+    assert.strictEqual(result.configs["dev"].commandMode, "whitelist");
+  });
+
+  it("should allow explicit blacklist command mode with whitelist patterns present", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    commandMode: blacklist
+    whitelist:
+      - "^pwd$"
+`;
+    const tempConfigPath = path.join(tempDir, "blacklist-mode.yaml");
+    fs.writeFileSync(tempConfigPath, configContent);
+
+    const result = loadConfigFromYaml(tempConfigPath);
+
+    assert.strictEqual(result.configs["dev"].commandMode, "blacklist");
+    assert.deepStrictEqual(result.configs["dev"].commandWhitelist, ["^pwd$"]);
+  });
+
+  it("should reject invalid command mode", () => {
+    const configContent = `
+servers:
+  dev:
+    host: 192.168.1.1
+    username: test
+    password: test
+    commandMode: permissive
+`;
+    const tempConfigPath = path.join(tempDir, "invalid-command-mode.yaml");
+    fs.writeFileSync(tempConfigPath, configContent);
+
+    assert.throws(
+      () => loadConfigFromYaml(tempConfigPath),
+      /commandMode.*blacklist.*whitelist/,
+    );
   });
 });
 
@@ -652,7 +956,7 @@ servers:
     );
   });
 
-  it("should reject chained jumps (jump host itself sets jumpHost)", () => {
+  it("should accept chained jumps (jump host itself sets jumpHost)", () => {
     const configContent = `
 servers:
   outer:
@@ -673,9 +977,37 @@ servers:
     const p = path.join(tempDir, "jump-chain.yaml");
     fs.writeFileSync(p, configContent);
 
+    const result = loadConfigFromYaml(p);
+    assert.strictEqual(result.configs["target"].jumpHost, "bastion");
+    assert.strictEqual(result.configs["bastion"].jumpHost, "outer");
+    assert.strictEqual(result.configs["outer"].jumpHost, undefined);
+  });
+
+  it("should reject a jumpHost cycle", () => {
+    const configContent = `
+servers:
+  a:
+    host: 10.0.0.0
+    username: a
+    password: apass
+    jumpHost: b
+  b:
+    host: 10.0.0.1
+    username: b
+    password: bpass
+    jumpHost: c
+  c:
+    host: 10.0.0.2
+    username: c
+    password: cpass
+    jumpHost: a
+`;
+    const p = path.join(tempDir, "jump-cycle.yaml");
+    fs.writeFileSync(p, configContent);
+
     assert.throws(
       () => loadConfigFromYaml(p),
-      /chained jumps are not supported/,
+      /cycle/i,
     );
   });
 

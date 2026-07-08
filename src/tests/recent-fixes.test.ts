@@ -136,6 +136,56 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     }
   });
 
+  it("does not let a closed stale connect promise delete a newer in-flight connect", async () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+
+    const originalDoConnect = manager.doConnect;
+    let doConnectCalls = 0;
+    let resolveFirst!: () => void;
+    let resolveSecond!: () => void;
+
+    manager.doConnect = async () => {
+      doConnectCalls += 1;
+      if (doConnectCalls === 1) {
+        return new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return new Promise<void>((resolve) => {
+        resolveSecond = resolve;
+      });
+    };
+
+    try {
+      const firstConnect = manager.connect("dev");
+      const firstTracked = manager.connecting.get("dev");
+      assert.ok(firstTracked, "first connect should install an in-flight promise");
+
+      manager.closeConnection("dev");
+      assert.strictEqual(manager.connecting.has("dev"), false);
+
+      const secondConnect = manager.connect("dev");
+      const secondTracked = manager.connecting.get("dev");
+      assert.ok(secondTracked, "second connect should install a fresh in-flight promise");
+      assert.notStrictEqual(secondTracked, firstTracked);
+
+      resolveFirst();
+      await firstConnect;
+      assert.strictEqual(
+        manager.connecting.get("dev"),
+        secondTracked,
+        "stale first connect must not delete the newer in-flight entry",
+      );
+
+      resolveSecond();
+      await secondConnect;
+      assert.strictEqual(manager.connecting.has("dev"), false);
+      assert.strictEqual(doConnectCalls, 2);
+    } finally {
+      manager.doConnect = originalDoConnect;
+    }
+  });
+
   it("returns immediately for an already-connected server without invoking doConnect", async () => {
     manager.setConfig({ dev: baseConfig() }, ["dev"]);
     manager.connected.set("dev", true);
@@ -154,6 +204,93 @@ describe("SSHConnectionManager.connect() in-flight dedup", () => {
     } finally {
       manager.doConnect = originalDoConnect;
     }
+  });
+
+  it("invalidates pending clients when hot-reload changes connection fields", () => {
+    manager.setConfig({ dev: baseConfig() }, ["dev"]);
+    const pendingClient = {
+      ended: false,
+      end() {
+        this.ended = true;
+      },
+    };
+    manager.pendingClients.set("dev", pendingClient);
+    manager.connecting.set("dev", Promise.resolve());
+    const generationBefore = manager.connectionGenerations.get("dev") ?? 0;
+
+    manager.replaceConfig(
+      { dev: baseConfig({ host: "127.0.0.2" }) },
+      ["dev"],
+    );
+
+    assert.strictEqual(pendingClient.ended, true);
+    assert.strictEqual(manager.pendingClients.has("dev"), false);
+    assert.strictEqual(manager.connecting.has("dev"), false);
+    assert.strictEqual(
+      manager.connectionGenerations.get("dev"),
+      generationBefore + 1,
+    );
+  });
+
+  it("resets a target when an upstream jump host's connection fields change", () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+    // Pretend the target is live through the chain.
+    manager.connected.set("target", true);
+    manager.clients.set("target", { end() {} });
+    const genBefore = manager.connectionGenerations.get("target") ?? 0;
+
+    manager.replaceConfig(
+      {
+        // Upstream hop changed; the target's own fields are untouched.
+        bastion: baseConfig({ name: "bastion", host: "10.9.9.9" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+
+    assert.strictEqual(manager.connected.get("target"), false);
+    assert.strictEqual(
+      manager.connectionGenerations.get("target"),
+      genBefore + 1,
+    );
+  });
+
+  it("leaves a target connected when nothing in its jump chain changed", () => {
+    manager.setConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({ name: "target", jumpHost: "bastion" }),
+      },
+      ["bastion", "target"],
+    );
+    manager.connected.set("target", true);
+    manager.clients.set("target", { end() {} });
+    const genBefore = manager.connectionGenerations.get("target") ?? 0;
+
+    // A policy-only change on the target (not a connection field).
+    manager.replaceConfig(
+      {
+        bastion: baseConfig({ name: "bastion" }),
+        target: baseConfig({
+          name: "target",
+          jumpHost: "bastion",
+          safeDirectory: "/tmp",
+        }),
+      },
+      ["bastion", "target"],
+    );
+
+    assert.strictEqual(manager.connected.get("target"), true);
+    assert.strictEqual(
+      manager.connectionGenerations.get("target"),
+      genBefore,
+    );
   });
 });
 

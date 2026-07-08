@@ -1,8 +1,83 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { SSHConnectionManager } from "../services/ssh-connection-manager.js";
+import { SSHConfig } from "../models/types.js";
+import {
+  BUILT_IN_COMMAND_BLACKLIST,
+  BUILT_IN_DESTRUCTIVE_GUARDS,
+  SSHConnectionManager,
+} from "../services/ssh-connection-manager.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError, formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
+
+export function formatCommandPolicy(config: SSHConfig): string {
+  const whitelist = config.commandWhitelist || [];
+  const blacklist = config.commandBlacklist || [];
+  const commandMode = config.commandMode
+    ?? (whitelist.length > 0 ? "whitelist" : "blacklist");
+
+  let output = `## Command Policy\n\n`;
+  output += `Mode: \`${commandMode}\``;
+  if (!config.commandMode && whitelist.length > 0) {
+    output += ` _(legacy whitelist config)_`;
+  }
+  output += `\n\n`;
+
+  output += `Built-in destructive command guards:\n\n`;
+  for (const { regex, reason } of BUILT_IN_DESTRUCTIVE_GUARDS) {
+    output += `- \`${regex.source}\` -> ${reason}\n`;
+  }
+  output += `\n`;
+
+  output += `Built-in dangerous-command blacklist:\n\n`;
+  for (const { regex, reason } of BUILT_IN_COMMAND_BLACKLIST) {
+    output += `- \`${regex.source}\` -> ${reason}\n`;
+  }
+  output += `\n`;
+
+  output += `## Allowed Commands (Whitelist)\n\n`;
+  if (commandMode !== "whitelist") {
+    output += `Whitelist is inactive in blacklist mode.\n\n`;
+  } else if (whitelist.length === 0) {
+    output += `WARNING: Whitelist mode is active but no whitelist patterns are configured, so all commands are blocked after blacklist checks.\n\n`;
+  } else {
+    output += `${whitelist.length} patterns:\n\n`;
+    for (const pattern of whitelist) {
+      const readable = patternToReadable(pattern);
+      output += `- \`${pattern}\``;
+      if (readable !== pattern) {
+        output += ` -> ${readable}`;
+      }
+      output += `\n`;
+    }
+    output += `\n`;
+  }
+
+  if (blacklist.length > 0) {
+    output += `## Blocked Commands (Blacklist)\n\n`;
+    output += `${blacklist.length} patterns:\n\n`;
+    for (const pattern of blacklist) {
+      const readable = patternToReadable(pattern);
+      output += `- \`${pattern}\``;
+      if (readable !== pattern) {
+        output += ` -> ${readable}`;
+      }
+      output += `\n`;
+    }
+    output += `\n`;
+  }
+
+  if (commandMode === "whitelist" && whitelist.length > 0) {
+    output += `## Example Commands\n\n`;
+    output += `Based on the active whitelist, here are some commands you can likely use:\n\n`;
+    const examples = generateExamples(whitelist);
+    for (const ex of examples.slice(0, 10)) {
+      output += `- \`${ex}\`\n`;
+    }
+    output += `\n`;
+  }
+
+  return output;
+}
 
 /**
  * Register show-whitelist tool
@@ -14,7 +89,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
   server.tool(
     "show-whitelist",
-    "Show the configured whitelist, blacklist, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
+    "Show the configured command policy, blacklist/whitelist patterns, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
     {
       connectionName: z
         .string()
@@ -41,43 +116,9 @@ export function registerShowWhitelistTool(server: McpServer): void {
           };
         }
 
-        const whitelist = config.commandWhitelist || [];
-        const blacklist = config.commandBlacklist || [];
-        
         let output = `# Command Permissions for: ${config.name}\n\n`;
         output += `Host: ${config.username}@${config.host}:${config.port}\n\n`;
-        
-        // Whitelist
-        output += `## ✅ Allowed Commands (Whitelist)\n\n`;
-        if (whitelist.length === 0) {
-          output += `⚠️ No whitelist configured - using default safe commands.\n\n`;
-        } else {
-          output += `${whitelist.length} patterns:\n\n`;
-          for (const pattern of whitelist) {
-            const readable = patternToReadable(pattern);
-            output += `- \`${pattern}\``;
-            if (readable !== pattern) {
-              output += ` → ${readable}`;
-            }
-            output += `\n`;
-          }
-          output += `\n`;
-        }
-        
-        // Blacklist
-        if (blacklist.length > 0) {
-          output += `## ❌ Blocked Commands (Blacklist)\n\n`;
-          output += `${blacklist.length} patterns:\n\n`;
-          for (const pattern of blacklist) {
-            const readable = patternToReadable(pattern);
-            output += `- \`${pattern}\``;
-            if (readable !== pattern) {
-              output += ` → ${readable}`;
-            }
-            output += `\n`;
-          }
-          output += `\n`;
-        }
+        output += formatCommandPolicy(config);
 
         // SFTP path policy (upload / download / transfer tools only)
         const allowedRemoteDirs = config.allowedRemoteDirectories ?? [];
@@ -86,14 +127,18 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
         output += `## 📂 SFTP Path Policy (upload / download / transfer)\n\n`;
 
+        if (config.disableSftpPathPolicy) {
+          output += `**\`disableSftpPathPolicy\` is set — all path containment checks below are bypassed.** ` +
+            `Any absolute remote path and any local path is allowed for upload/download/transfer.\n\n`;
+        }
+
         // ----- Remote directories -----
         output += `### Allowed remote directories\n\n`;
-        if (allowedRemoteDirs.length === 0) {
-          output += `⚠️ **\`allowedRemoteDirectories\` is NOT configured.** ` +
-            `SFTP upload/download/transfer is **disabled** for this server — every call will be rejected with \`REMOTE_PATH_NOT_ALLOWED\`. ` +
-            `To enable file transfer, add absolute POSIX directories under \`allowedRemoteDirectories\` in the server's YAML config.\n\n`;
+        if (config.disableSftpPathPolicy || allowedRemoteDirs.length === 0) {
+          output += `\`allowedRemoteDirectories\` is not configured, so **any absolute POSIX path is allowed** (default is open). ` +
+            `To restrict SFTP to specific directories, add them under \`allowedRemoteDirectories\` in the server's YAML config.\n\n`;
         } else {
-          output += `${allowedRemoteDirs.length} entr${allowedRemoteDirs.length === 1 ? "y" : "ies"}:\n\n`;
+          output += `${allowedRemoteDirs.length} entr${allowedRemoteDirs.length === 1 ? "y" : "ies"} (restricting SFTP to these paths only):\n\n`;
           for (const dir of allowedRemoteDirs) {
             output += `- \`${dir}\`\n`;
           }
@@ -102,24 +147,30 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
         // ----- Local directories -----
         output += `### Allowed local directories\n\n`;
-        output += `Always implicitly allowed: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
-        if (allowedLocalDirs.length === 0) {
-          output += `⚠️ **\`allowedLocalDirectories\` is NOT configured.** ` +
-            `Only paths inside the MCP working directory above can be used as the local side of upload/download — any other path will be rejected with \`LOCAL_PATH_NOT_ALLOWED\`. ` +
-            `To allow more locations, add absolute host paths under \`allowedLocalDirectories\` in the server's YAML config.\n\n`;
+        if (config.disableSftpPathPolicy) {
+          output += `\`disableSftpPathPolicy\` is set, so **any local path is allowed**.\n\n`;
         } else {
-          output += `Additional entries (${allowedLocalDirs.length}):\n\n`;
-          for (const dir of allowedLocalDirs) {
-            output += `- \`${dir}\`\n`;
+          output += `Always implicitly allowed: \`${mcpCwd}\` _(the MCP working directory)_\n\n`;
+          if (allowedLocalDirs.length === 0) {
+            output += `\`allowedLocalDirectories\` is not configured. ` +
+              `Only paths inside the MCP working directory above can be used as the local side of upload/download — any other path will be rejected with \`LOCAL_PATH_NOT_ALLOWED\`. ` +
+              `To allow more locations, add absolute host paths under \`allowedLocalDirectories\`, or set \`disableSftpPathPolicy: true\` to allow any local path.\n\n`;
+          } else {
+            output += `Additional entries (${allowedLocalDirs.length}):\n\n`;
+            for (const dir of allowedLocalDirs) {
+              output += `- \`${dir}\`\n`;
+            }
+            output += `\n`;
           }
-          output += `\n`;
         }
 
         // ----- Matching rules -----
         output += `### Matching rules\n\n`;
-        output += `- A path is allowed iff it equals an entry above, or starts with \`<entry> + separator\`.\n`;
-        output += `- Remote paths must be absolute POSIX (\`/...\`); \`..\` segments and null bytes are rejected up-front.\n`;
-        output += `- Local paths are resolved on the MCP host first, then matched.\n`;
+        output += `- Default is open: with no \`allowedRemoteDirectories\` configured, any absolute POSIX remote path is allowed.\n`;
+        output += `- Configuring \`allowedRemoteDirectories\` opts into an allowlist — a path is then allowed iff it equals an entry, or starts with \`<entry> + separator\`.\n`;
+        output += `- \`disableSftpPathPolicy: true\` bypasses both the remote allowlist and the local directory check entirely.\n`;
+        output += `- Remote paths must be absolute POSIX (\`/...\`); \`..\` segments and null bytes are rejected up-front regardless of policy.\n`;
+        output += `- Local paths are resolved on the MCP host first, then matched (unless \`disableSftpPathPolicy\` is set).\n`;
         output += `- These path lists do **not** affect \`execute-command\`. They only restrict SFTP file transfers.\n\n`;
 
         // ----- Output log policy (execute-command full-output persistence) -----
@@ -132,14 +183,6 @@ export function registerShowWhitelistTool(server: McpServer): void {
         output += `- File name: \`<timestamp>-<pid>-<rand>.log\` with \`=== META / STDOUT / STDERR / END ===\` markers.\n`;
         output += `- When output is truncated, the response includes an \`[OUTPUT TRUNCATED]\` header with the on-disk log path.\n\n`;
 
-        // Quick examples
-        output += `## 💡 Example Commands\n\n`;
-        output += `Based on the whitelist, here are some commands you can likely use:\n\n`;
-        const examples = generateExamples(whitelist);
-        for (const ex of examples.slice(0, 10)) {
-          output += `- \`${ex}\`\n`;
-        }
-        
         return {
           content: [{ type: "text", text: output }],
         };

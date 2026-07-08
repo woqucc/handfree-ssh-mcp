@@ -7,6 +7,15 @@
 # Whether to pre-connect to all servers on startup
 preConnect: false
 
+# OpenSSH config loading is enabled by default. Same-named entries below can
+# override connection fields or add security policy for a Host from ~/.ssh/config.
+# sshConfig: true
+# sshConfig:
+#   enabled: true
+#   paths:
+#     - ~/.ssh/config
+#     - ~/.ssh/config.d/work
+
 # Optional: directory where execute-command persists FULL stdout/stderr logs.
 # Per-call logs land under <outputLogDir>/<server-name>/<username>/<timestamp>-<pid>-<rand>.log.
 # Supports ~ expansion and relative paths (resolved against the MCP cwd).
@@ -17,6 +26,8 @@ preConnect: false
 servers:
   # Development server example
   dev:
+    # These connection fields are optional when a same-named `Host dev`
+    # exists in ~/.ssh/config. YAML values override OpenSSH config values.
     host: 192.168.1.100
     port: 22
     username: root
@@ -27,33 +38,33 @@ servers:
     # Optional: SOCKS proxy for connection
     # socksProxy: socks5://proxy-host:1085
     # Optional: tunnel SSH through another server in this file (ProxyJump-style).
-    # Single level only — the referenced server must not itself set `jumpHost`.
+    # Chains to any depth — the referenced server may itself set `jumpHost`
+    # (target -> J1 -> J2 -> ...); only cycles are rejected.
     # Mutually exclusive with `socksProxy`. The target uses its own credentials
     # and policy; the jump host is purely transport.
     # jumpHost: bastion
     # Safe directory for rm commands (optional)
     # safeDirectory: /home/root
     # SFTP path policy (upload / download / transfer ONLY — execute-command is unaffected).
-    # If `allowedRemoteDirectories` is unset or empty, SFTP is DISABLED for this server.
+    # Default is OPEN: with `allowedRemoteDirectories` unset or empty, any absolute
+    # POSIX remote path is allowed. Configure it to opt into an allowlist instead.
     # allowedRemoteDirectories:
     #   - /home/root
     #   - /tmp
     # Additional local directories permitted as upload source / download target.
-    # The MCP working directory is always allowed implicitly.
+    # The MCP working directory is always allowed implicitly; with no
+    # `allowedLocalDirectories`, only that directory is allowed as the local side.
     # allowedLocalDirectories:
     #   - /path/to/extra/local/dir
-    # Command security: whitelist of allowed command patterns (regex)
-    whitelist:
-      - "^ls( .*)?$"
-      - "^cat .*$"
-      - "^head .*$"
-      - "^tail .*$"
-      - "^pwd$"
-      - "^echo .*$"
-      - "^ping -c \\d+ .*$"
-      - "^git .*$"
-      - "^docker ps.*$"
-      - "^docker logs.*$"
+    # Set true to bypass both the remote allowlist and the local directory check
+    # entirely (any remote path, any local path). Overrides allowedRemoteDirectories.
+    # disableSftpPathPolicy: true
+    # Command security. Default mode is blacklist: commands are allowed unless
+    # they hit the built-in dangerous blacklist or one of these patterns.
+    # Use `commandMode: whitelist` when you want whitelist patterns to be required.
+    commandMode: blacklist
+    blacklist:
+      - "^docker system prune.*$"
 
   # Production server example (commented out)
   # prod:
@@ -63,6 +74,7 @@ servers:
   #   password: your_production_password
   #   socksProxy: socks5://proxy.example.com:1085
   #   safeDirectory: /home/deploy  # rm only allowed here
+  #   commandMode: whitelist
   #   whitelist:
   #     - "^ls( .*)?$"
   #     - "^cat .*$"
